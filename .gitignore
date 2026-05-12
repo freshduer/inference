@@ -158,3 +158,5 @@ pyrightconfig.json
 *.txt
 *.json
 *.csv
+*.err
+*.out

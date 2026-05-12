@@ -169,6 +169,8 @@ def move_sparse_output_to_device(
     uih_seq_lengths: torch.Tensor,
     num_candidates: torch.Tensor,
     device: torch.device,
+    embedding_dtype: torch.dtype = torch.bfloat16,
+    stream: Optional[torch.cuda.Stream] = None,
 ) -> Tuple[
     Dict[str, SequenceEmbedding],
     Dict[str, torch.Tensor],
@@ -178,7 +180,9 @@ def move_sparse_output_to_device(
     """
     Move sparse module outputs from CPU to the target device (typically GPU).
 
-    Converts embeddings to bfloat16 for efficient GPU computation.
+    Converts embeddings to the requested dtype for efficient GPU computation.
+    Uses non-blocking transfers so the CPU can continue while DMA is in progress.
+    If a CUDA stream is provided, transfers are issued on that stream.
 
     Args:
         seq_embeddings: Dictionary of sequence embeddings to move.
@@ -186,20 +190,23 @@ def move_sparse_output_to_device(
         uih_seq_lengths: UIH sequence lengths tensor to move.
         num_candidates: Number of candidates tensor to move.
         device: Target device (e.g., torch.device('cuda:0')).
+        stream: Optional CUDA stream to use for async transfers.
 
     Returns:
         Tuple of moved tensors on the target device.
     """
-    num_candidates = num_candidates.to(device)
-    uih_seq_lengths = uih_seq_lengths.to(device)
-    seq_embeddings = {
-        k: SequenceEmbedding(
-            lengths=seq_embeddings[k].lengths.to(device),
-            embedding=seq_embeddings[k].embedding.to(
-                device).to(torch.bfloat16),
-        )
-        for k in seq_embeddings.keys()
-    }
-    for k, v in payload_features.items():
-        payload_features[k] = v.to(device)
+    ctx = torch.cuda.stream(stream) if stream is not None else torch.cuda.stream(torch.cuda.current_stream(device))
+    with ctx:
+        num_candidates = num_candidates.to(device, non_blocking=True)
+        uih_seq_lengths = uih_seq_lengths.to(device, non_blocking=True)
+        seq_embeddings = {
+            k: SequenceEmbedding(
+                lengths=seq_embeddings[k].lengths.to(device, non_blocking=True),
+                embedding=seq_embeddings[k].embedding.to(
+                    device, non_blocking=True).to(embedding_dtype),
+            )
+            for k in seq_embeddings.keys()
+        }
+        for k, v in payload_features.items():
+            payload_features[k] = v.to(device, non_blocking=True)
     return seq_embeddings, payload_features, uih_seq_lengths, num_candidates

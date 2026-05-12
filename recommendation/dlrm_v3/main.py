@@ -678,9 +678,10 @@ def run(
     np.random.seed(numpy_rand_seed)
     random.seed(numpy_rand_seed)
 
-    hstu_config = get_hstu_configs(dataset)
+    use_extra = os.environ.get("USE_EXTRA_TABLES", "0") == "1"
+    hstu_config = get_hstu_configs(dataset, use_extra_tables=use_extra)
     hstu_config.max_num_candidates = hstu_config.max_num_candidates_inference
-    table_config = get_embedding_table_config(dataset)
+    table_config = get_embedding_table_config(dataset, use_extra_tables=use_extra)
     set_is_inference(is_inference=not compute_eval)
 
     user_conf = os.path.abspath(USER_CONF)

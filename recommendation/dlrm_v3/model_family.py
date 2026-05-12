@@ -54,6 +54,16 @@ from torchrec.test_utils import get_free_port
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+def _get_dense_inference_dtype() -> torch.dtype:
+    """
+    Use bfloat16 only on GPUs with native support (Ampere+).
+    """
+    if not torch.cuda.is_available():
+        return torch.float32
+    major, _ = torch.cuda.get_device_capability()
+    return torch.bfloat16 if major >= 8 else torch.float16
+
+
 class HSTUModelFamily:
     """
     High-level interface for the HSTU model family.
@@ -67,6 +77,7 @@ class HSTUModelFamily:
         output_trace: Whether to enable profiling trace output.
         sparse_quant: Whether to quantize sparse embeddings.
         compute_eval: Whether to compute evaluation metrics (includes labels).
+        use_compile: Whether to apply torch.compile to the dense model.
     """
 
     def __init__(
@@ -76,6 +87,7 @@ class HSTUModelFamily:
         output_trace: bool = False,
         sparse_quant: bool = False,
         compute_eval: bool = False,
+        use_compile: bool = False,
     ) -> None:
         self.hstu_config = hstu_config
         self.table_config = table_config
@@ -100,6 +112,7 @@ class HSTUModelFamily:
                 table_config=table_config,
                 output_trace=output_trace,
                 compute_eval=compute_eval,
+                use_compile=use_compile,
             )
         )
 
@@ -334,11 +347,17 @@ class ModelFamilyDenseDist:
     Spawns worker processes for each GPU to run dense forward passes in parallel,
     with samples distributed via inter-process queues.
 
+    Optimization notes:
+    - CPU tensors are passed through the queue (shared memory, zero-copy) rather than
+      CUDA tensors (which require expensive CUDA IPC + deepcopy).
+    - GPU transfer and torch.compile happen inside each worker process.
+
     Args:
         hstu_config: HSTU model configuration.
         table_config: Embedding table configurations.
         output_trace: Whether to enable profiling traces.
         compute_eval: Whether to compute evaluation metrics.
+        use_compile: Whether to apply torch.compile to the dense model.
     """
 
     def __init__(
@@ -347,12 +366,15 @@ class ModelFamilyDenseDist:
         table_config: Dict[str, EmbeddingConfig],
         output_trace: bool = False,
         compute_eval: bool = False,
+        use_compile: bool = False,
     ) -> None:
         super(ModelFamilyDenseDist, self).__init__()
         self.hstu_config = hstu_config
         self.table_config = table_config
         self.output_trace = output_trace
         self.compute_eval = compute_eval
+        self.use_compile = use_compile
+        self.dense_dtype = _get_dense_inference_dtype()
 
         ngpus = torch.cuda.device_count()
         self.world_size = int(os.environ.get("WORLD_SIZE", str(ngpus)))
@@ -395,27 +417,25 @@ class ModelFamilyDenseDist:
         """
         Initialize and run a dense worker process.
 
-        Each worker loads the model, processes samples from its queue, and
-        returns results.
+        Each worker loads the model, moves CPU tensors to GPU, runs dense forward,
+        and returns results. CPU tensors are received from the queue (shared memory,
+        no deepcopy needed), and GPU transfer happens inside the worker.
 
         Args:
             rank: Process rank (GPU index).
             world_size: Total number of worker processes.
             model_path: Path to model checkpoint.
         """
-        # nprocs_per_rank = 16
-        # start_core: int = nprocs_per_rank * rank + 128
-        # cores: set[int] = set([start_core + i for i in range(nprocs_per_rank)])
-        # os.sched_setaffinity(0, cores)
         set_is_inference(is_inference=not self.compute_eval)
+        dense_dtype = self.dense_dtype
         model = get_hstu_model(
             table_config=self.table_config,
             hstu_config=self.hstu_config,
             table_device="cpu",
             max_hash_size=100,
             is_dense=True,
-        ).to(torch.bfloat16)
-        model.set_training_dtype(torch.bfloat16)
+        ).to(dense_dtype)
+        model.set_training_dtype(dense_dtype)
         device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(f"cuda:{rank}")
         load_nonsparse_checkpoint(
@@ -423,7 +443,26 @@ class ModelFamilyDenseDist:
         )
         model = model.to(device)
         model.eval()
+
+        if self.use_compile:
+            try:
+                logger.warning(f"[rank {rank}] Applying torch.compile to dense model...")
+                # mode='default' uses TorchInductor without CUDA graphs.
+                # The model has .item() calls which prevent CUDA graph capture,
+                # so 'reduce-overhead' would silently fall back anyway; 'default'
+                # is more robust and still fuses kernels via Inductor.
+                model.main_forward = torch.compile(
+                    model.main_forward,
+                    mode="default",
+                    dynamic=True,
+                    fullgraph=False,
+                )
+                logger.warning(f"[rank {rank}] torch.compile applied successfully.")
+            except Exception as e:
+                logger.warning(f"[rank {rank}] torch.compile failed ({e}), running eager.")
+
         profiler = Profiler(rank) if self.output_trace else None
+        transfer_stream = torch.cuda.Stream(device=device)
 
         with torch.no_grad():
             while True:
@@ -435,9 +474,7 @@ class ModelFamilyDenseDist:
                     assert profiler is not None
                     profiler.step()
                 with torch.profiler.record_function("get_item_from_queue"):
-                    # Copy here to release data in the producer to avoid
-                    # invalid cuda caching allocator release.
-                    item = copy.deepcopy(item)
+                    # Items are CPU tensors passed via shared memory – no deepcopy needed.
                     (
                         id,
                         seq_embeddings,
@@ -448,6 +485,20 @@ class ModelFamilyDenseDist:
                         num_candidates,
                     ) = item
                     assert seq_embeddings is not None
+                    # Move CPU tensors to GPU inside the worker (non-blocking).
+                    seq_embeddings, payload_features, uih_seq_lengths, num_candidates = (
+                        move_sparse_output_to_device(
+                            seq_embeddings=seq_embeddings,
+                            payload_features=payload_features,
+                            uih_seq_lengths=uih_seq_lengths,
+                            num_candidates=num_candidates,
+                            device=device,
+                            embedding_dtype=self.dense_dtype,
+                            stream=transfer_stream,
+                        )
+                    )
+                    # Ensure transfers are complete before the default stream uses them.
+                    torch.cuda.current_stream(device).wait_stream(transfer_stream)
                 with torch.profiler.record_function("dense forward"):
                     (
                         _,
@@ -464,9 +515,6 @@ class ModelFamilyDenseDist:
                         max_num_candidates=max_num_candidates,
                         num_candidates=num_candidates,
                     )
-                    # mt_target_preds = torch.empty(1, 2048 * 20).to(device="cpu")
-                    # mt_target_labels = None
-                    # mt_target_weights = None
                     assert mt_target_preds is not None
                     mt_target_preds = mt_target_preds.detach().to(device="cpu")
                     if mt_target_labels is not None:
@@ -521,11 +569,12 @@ class ModelFamilyDenseDist:
         """
         Run distributed dense forward pass.
 
-        Dispatches work to a worker process and collects results.
+        Dispatches CPU tensors to a worker process (via shared memory) and
+        collects results. GPU transfer happens inside the worker.
 
         Args:
-            seq_embeddings: Sequence embeddings from sparse module.
-            payload_features: Additional feature tensors.
+            seq_embeddings: Sequence embeddings from sparse module (CPU tensors).
+            payload_features: Additional feature tensors (CPU tensors).
             max_uih_len: Maximum UIH sequence length.
             uih_seq_lengths: Per-sample UIH lengths.
             max_num_candidates: Maximum candidates per sample.
@@ -541,22 +590,15 @@ class ModelFamilyDenseDist:
                 self.samples_q[rank].put(-1)
             return None
         rank = self.get_rank()
-        device = torch.device(f"cuda:{rank}")
         assert (
             payload_features is not None
             and num_candidates is not None
             and uih_seq_lengths is not None
         )
         t0: float = time.time()
-        seq_embeddings, payload_features, uih_seq_lengths, num_candidates = (
-            move_sparse_output_to_device(
-                seq_embeddings=seq_embeddings,
-                payload_features=payload_features,
-                uih_seq_lengths=uih_seq_lengths,
-                num_candidates=num_candidates,
-                device=device,
-            )
-        )
+        # Pass CPU tensors directly into the queue. Workers receive them via shared
+        # memory (zero-copy), then do the GPU transfer internally – this removes the
+        # CUDA-IPC overhead and the expensive deepcopy that was previously needed.
         self.samples_q[rank].put(
             (
                 id,
@@ -586,11 +628,16 @@ class ModelFamilyDenseSingleWorker:
 
     Simpler alternative to ModelFamilyDenseDist for single-GPU setups.
 
+    Optimization notes:
+    - torch.compile is applied to main_forward for kernel fusion.
+    - A dedicated CUDA transfer stream overlaps CPU-to-GPU copies with prior work.
+
     Args:
         hstu_config: HSTU model configuration.
         table_config: Embedding table configurations.
         output_trace: Whether to enable profiling traces.
         compute_eval: Whether to compute evaluation metrics.
+        use_compile: Whether to apply torch.compile to the dense model.
     """
 
     def __init__(
@@ -599,25 +646,32 @@ class ModelFamilyDenseSingleWorker:
         table_config: Dict[str, EmbeddingConfig],
         output_trace: bool = False,
         compute_eval: bool = False,
+        use_compile: bool = False,
     ) -> None:
         self.model: Optional[torch.nn.Module] = None
         self.hstu_config = hstu_config
         self.table_config = table_config
         self.output_trace = output_trace
+        self.use_compile = use_compile
+        self.dense_dtype = _get_dense_inference_dtype()
         self.device: torch.device = torch.device("cuda:0")
         torch.cuda.set_device(self.device)
         self.profiler: Optional[Profiler] = (
             Profiler(rank=0) if self.output_trace else None
         )
+        self.transfer_stream: Optional[torch.cuda.Stream] = None
 
     def load(self, model_path: str) -> None:
         """
         Load dense model for single-GPU inference.
 
+        Applies torch.compile after loading to reduce kernel launch overhead.
+
         Args:
             model_path: Path to the model checkpoint directory.
         """
         logger.warning(f"Loading dense module from {model_path}")
+        dense_dtype = self.dense_dtype
         self.model = (
             get_hstu_model(
                 table_config=self.table_config,
@@ -626,14 +680,33 @@ class ModelFamilyDenseSingleWorker:
                 is_dense=True,
             )
             .to(self.device)
-            .to(torch.bfloat16)
+            .to(dense_dtype)
         )
-        self.model.set_training_dtype(torch.bfloat16)
+        self.model.set_training_dtype(dense_dtype)
         load_nonsparse_checkpoint(
             model=self.model, device=self.device, optimizer=None, path=model_path
         )
         assert self.model is not None
         self.model.eval()
+
+        if self.use_compile:
+            try:
+                logger.warning("Applying torch.compile to dense model main_forward...")
+                # mode='default' uses TorchInductor without CUDA graphs.
+                # The model has .item() calls which prevent CUDA graph capture,
+                # so 'reduce-overhead' would silently fall back anyway; 'default'
+                # is more robust and still fuses kernels via Inductor.
+                self.model.main_forward = torch.compile(  # pyre-ignore [8]
+                    self.model.main_forward,
+                    mode="default",
+                    dynamic=True,
+                    fullgraph=False,
+                )
+                logger.warning("torch.compile applied successfully.")
+            except Exception as e:
+                logger.warning(f"torch.compile failed ({e}), running eager.")
+
+        self.transfer_stream = torch.cuda.Stream(device=self.device)
 
     def predict(
         self,
@@ -653,6 +726,10 @@ class ModelFamilyDenseSingleWorker:
     ]:
         """
         Run dense forward pass on single GPU.
+
+        CPU-to-GPU transfers use a dedicated stream and non-blocking copies.
+        The default stream waits for the transfer stream before starting the
+        forward pass, enabling overlap with other CPU-side work.
 
         Args:
             seq_embeddings: Sequence embeddings from sparse module.
@@ -683,8 +760,12 @@ class ModelFamilyDenseSingleWorker:
                     uih_seq_lengths=uih_seq_lengths,
                     num_candidates=num_candidates,
                     device=self.device,
+                    embedding_dtype=self.dense_dtype,
+                    stream=self.transfer_stream,
                 )
             )
+            # Ensure all non-blocking transfers finish before the compute stream uses them.
+            torch.cuda.current_stream(self.device).wait_stream(self.transfer_stream)  # pyre-ignore [6]
             assert self.model is not None
             (
                 _,

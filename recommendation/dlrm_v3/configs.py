@@ -30,8 +30,18 @@ from torchrec.modules.embedding_configs import DataType, EmbeddingConfig
 HSTU_EMBEDDING_DIM = 512  # final DLRMv3 model
 HASH_SIZE = 1_000_000_000
 
+# Extra embedding tables added to simulate production multi-feature setup.
+# Each maps (UIH feature, candidate feature) → one shared table.
+EXTRA_TABLES = [
+    # (table_name, num_embeddings, uih_feature, candidate_feature)
+    ("item_creator_id",   HASH_SIZE,      "item_creator_id",   "item_candidate_creator_id"),
+    ("item_tag_id",       HASH_SIZE,      "item_tag_id",       "item_candidate_tag_id"),
+    ("user_location_id",  10_000_000,     "user_location_id",  "item_candidate_location_id"),
+    ("item_quality_id",   HASH_SIZE,      "item_quality_id",   "item_candidate_quality_id"),
+]
 
-def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
+
+def get_hstu_configs(dataset: str = "debug", use_extra_tables: bool = False) -> DlrmHSTUConfig:
     """
     Create and return HSTU model configuration.
 
@@ -111,11 +121,22 @@ def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
             task_type=MultitaskTaskType.BINARY_CLASSIFICATION,
         )
     ]
+    if use_extra_tables:
+        for _, _, uih_feat, cand_feat in EXTRA_TABLES:
+            hstu_config.hstu_uih_feature_names = (
+                hstu_config.hstu_uih_feature_names or []
+            ) + [uih_feat]
+            hstu_config.hstu_candidate_feature_names = (
+                hstu_config.hstu_candidate_feature_names or []
+            ) + [cand_feat]
+            hstu_config.merge_uih_candidate_feature_mapping = (
+                hstu_config.merge_uih_candidate_feature_mapping or []
+            ) + [(uih_feat, cand_feat)]
     return hstu_config
 
 
 def get_embedding_table_config(
-        dataset: str = "debug") -> Dict[str, EmbeddingConfig]:
+        dataset: str = "debug", use_extra_tables: bool = False) -> Dict[str, EmbeddingConfig]:
     """
     Create and return embedding table configurations.
 
@@ -152,4 +173,17 @@ def get_embedding_table_config(
             data_type=DataType.FP16,
             feature_names=["user_id"],
         ),
-    }
+    } | (
+        {
+            tbl_name: EmbeddingConfig(
+                num_embeddings=num_emb,
+                embedding_dim=HSTU_EMBEDDING_DIM,
+                name=tbl_name,
+                data_type=DataType.FP16,
+                feature_names=[uih_feat, cand_feat],
+            )
+            for tbl_name, num_emb, uih_feat, cand_feat in EXTRA_TABLES
+        }
+        if use_extra_tables
+        else {}
+    )

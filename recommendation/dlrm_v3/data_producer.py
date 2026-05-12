@@ -112,8 +112,18 @@ class SingleThreadDataProducer:
                 start_idx = 0
                 for sample, ts_idx, q_idx in result:
                     batch_size: int = sample.batch_size()
+                    query_id_slice = query_ids[start_idx: start_idx + batch_size]
+                    start_idx += batch_size
+                    if not query_id_slice:
+                        logger.warning(
+                            "Skipping streaming batch with no query ids: "
+                            "sample_batch_size=%d, query_idx_count=%d",
+                            batch_size,
+                            len(q_idx),
+                        )
+                        continue
                     query = QueryItem(
-                        query_ids=query_ids[start_idx: start_idx + batch_size],
+                        query_ids=query_id_slice,
                         samples=sample,
                         start=t0,
                         dt_queue=dt_queue,
@@ -121,7 +131,6 @@ class SingleThreadDataProducer:
                         ts_idx=ts_idx,
                         query_idx=q_idx,
                     )
-                    start_idx += batch_size
                     self.run_one_item(query)
 
     def finish(self) -> None:
@@ -200,8 +209,18 @@ class MultiThreadDataProducer:
                 start_idx = 0
                 for sample, ts_idx, q_idx in result:
                     batch_size: int = sample.batch_size()
+                    query_id_slice = query_ids[start_idx: start_idx + batch_size]
+                    start_idx += batch_size
+                    if not query_id_slice:
+                        logger.warning(
+                            "Skipping streaming batch with no query ids: "
+                            "sample_batch_size=%d, query_idx_count=%d",
+                            batch_size,
+                            len(q_idx),
+                        )
+                        continue
                     qitem = QueryItem(
-                        query_ids=query_ids[start_idx: start_idx + batch_size],
+                        query_ids=query_id_slice,
                         samples=sample,
                         start=t0,
                         dt_queue=dt_queue,
@@ -209,7 +228,6 @@ class MultiThreadDataProducer:
                         ts_idx=ts_idx,
                         query_idx=q_idx,
                     )
-                    start_idx += batch_size
                     with torch.inference_mode(), torch.cuda.stream(stream):
                         self.run_one_item(qitem)
             tasks_queue.task_done()

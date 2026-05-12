@@ -229,12 +229,14 @@ def get_random_data(
     uih_max_seq_len: int,
     max_num_candidates: int,
     value_bound: int = 1000,
+    feature_bounds: Dict[str, int] = {},
 ):
     """
     Generate random sample data for testing and debugging.
 
     Creates synthetic user interaction history and candidate features
-    with random values.
+    with random values bounded per feature so IDs never exceed the
+    corresponding embedding table size.
 
     Args:
         contexual_features: List of contextual feature names.
@@ -242,7 +244,12 @@ def get_random_data(
         hstu_candidates_keys: List of candidate feature keys.
         uih_max_seq_len: Maximum sequence length for UIH.
         max_num_candidates: Maximum number of candidates.
-        value_bound: Upper bound for random values.
+        value_bound: Default upper bound for random values when a feature
+            is not listed in ``feature_bounds``.
+        feature_bounds: Per-feature upper bound (exclusive).  Keys are
+            feature names; values are the ``num_embeddings`` of the
+            corresponding table.  When provided, overrides
+            ``value_bound`` for that feature.
 
     Returns:
         Tuple of (uih_features_kjt, candidates_features_kjt).
@@ -256,37 +263,38 @@ def get_random_data(
         uih_max_seq_len + 1,
         (1,),
     ).item()
-    uih_lengths = torch.tensor(
-        [1 for _ in uih_non_seq_feature_keys]
-        + [uih_seq_len for _ in uih_seq_feature_keys]
-    )
-    # logging.info(f"uih_lengths: {uih_lengths}")
-    uih_values = torch.randint(
-        1,
-        value_bound,
-        # pyre-ignore[6]
-        (uih_seq_len * len(uih_seq_feature_keys) + len(uih_non_seq_feature_keys),),
-    )
+
+    def _bound(feat: str) -> int:
+        return min(feature_bounds.get(feat, value_bound), value_bound if not feature_bounds else feature_bounds.get(feat, value_bound))
+
+    # Build UIH values feature-by-feature so each uses its own bound.
+    uih_values_list: List[torch.Tensor] = []
+    uih_lengths_list: List[int] = []
+    for feat in uih_non_seq_feature_keys:
+        uih_values_list.append(torch.randint(1, max(2, _bound(feat)), (1,)))
+        uih_lengths_list.append(1)
+    for feat in uih_seq_feature_keys:
+        uih_values_list.append(torch.randint(1, max(2, _bound(feat)), (int(uih_seq_len),)))  # pyre-ignore[6]
+        uih_lengths_list.append(int(uih_seq_len))
+
     uih_features_kjt = KeyedJaggedTensor(
         keys=uih_non_seq_feature_keys + uih_seq_feature_keys,
-        lengths=uih_lengths.long(),
-        values=uih_values.long(),
+        lengths=torch.tensor(uih_lengths_list).long(),
+        values=torch.cat(uih_values_list).long(),
     )
+
     num_candidates = torch.randint(
         1,
         max_num_candidates + 1,
         (1,),
     ).item()
-    candidates_lengths = num_candidates * torch.ones(len(hstu_candidates_keys))
-    candidates_values = torch.randint(
-        1,
-        value_bound,
-        (num_candidates * len(hstu_candidates_keys),),  # pyre-ignore[6]
-    )
+    cand_values_list: List[torch.Tensor] = []
+    for feat in hstu_candidates_keys:
+        cand_values_list.append(torch.randint(1, max(2, _bound(feat)), (int(num_candidates),)))  # pyre-ignore[6]
     candidates_features_kjt = KeyedJaggedTensor(
         keys=hstu_candidates_keys,
-        lengths=candidates_lengths.long(),
-        values=candidates_values.long(),
+        lengths=(num_candidates * torch.ones(len(hstu_candidates_keys))).long(),
+        values=torch.cat(cand_values_list).long(),
     )
     return uih_features_kjt, candidates_features_kjt
 
@@ -310,6 +318,7 @@ class DLRMv3RandomDataset(Dataset):
         hstu_config: DlrmHSTUConfig,
         num_aggregated_samples: int = 10000,
         is_inference: bool = False,
+        embedding_config: Dict = {},
         *args,
         **kwargs,
     ):
@@ -343,6 +352,13 @@ class DLRMv3RandomDataset(Dataset):
             self.contexual_features = [
                 p[0] for p in hstu_config.contextual_feature_to_max_length
             ]
+
+        # Build per-feature ID bound from embedding_config so get_random_data
+        # never generates an out-of-range index.
+        self._feature_bounds: Dict[str, int] = {}
+        for tbl_cfg in (embedding_config or {}).values():
+            for feat_name in tbl_cfg.feature_names:
+                self._feature_bounds[feat_name] = tbl_cfg.num_embeddings
 
         self.num_aggregated_samples = num_aggregated_samples
         self.items_in_memory = {}
@@ -398,5 +414,6 @@ class DLRMv3RandomDataset(Dataset):
                 hstu_candidates_keys=self.hstu_config.hstu_candidate_feature_names,
                 uih_max_seq_len=self._max_uih_len,
                 max_num_candidates=max_num_candidates,
+                feature_bounds=self._feature_bounds,
             )
         self.last_loaded = time.time()
