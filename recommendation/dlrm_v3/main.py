@@ -383,10 +383,12 @@ def add_results(
         logger.warning(f"timing of {i}: {timing}")
 
     logger.warning(
-        "{} qps={:.2f}, avg_query_time={:.4f}, time={:.3f}, queries={}, tiles={}".format(
+        "{} qps={:.2f}, avg_batch_latency={:.4f}s ({:.2f}ms), wall_clock={:.3f}s, "
+        "num_batches={}, total_tiles={}".format(
             final_results["scenario"],
             final_results["qps"],
             final_results["avg_time"],
+            final_results["avg_time"] * 1000.0,
             final_results["took"],
             len(result_timing),
             buckets_str_dict["total"],

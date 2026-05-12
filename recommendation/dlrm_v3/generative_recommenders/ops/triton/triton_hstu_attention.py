@@ -384,7 +384,7 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
             max_ids,
         )
     offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
-    invalid_mask = invalid_mask or (offs_m_minus_n > 0)
+    invalid_mask = invalid_mask | (offs_m_minus_n > 0)
     if HAS_MAX_ATTN_LEN:
         invalid_mask = invalid_mask and offs_m_minus_n <= max_attn_len
     if HAS_CONTEXTUAL_SEQ_LEN:

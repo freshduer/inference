@@ -7,6 +7,7 @@ and testing purposes. It creates user-item interaction histories with timestamps
 ratings, and category-based item distributions.
 """
 
+import argparse
 import csv
 import logging
 import math
@@ -625,17 +626,53 @@ def copy_sub_dataset(src_folder: str) -> None:
     logger.warning("Files copied successfully.")
 
 
+def _out_dir(path: str) -> str:
+    """Absolute output directory with trailing separator (matches path concat style)."""
+    out = os.path.abspath(path)
+    if not out.endswith(os.sep):
+        out += os.sep
+    return out
+
+
 def main() -> None:
     """
     Main entry point for synthetic data generation.
 
     Configures and launches parallel workers to generate a complete
     streaming recommendation dataset.
+
+    Presets:
+      - ``full``: original MLPerf-scale workload (multi-TB); many parallel files
+        and 1B-item catalog (high CPU RAM for ``item_rating``).
+      - ``sampled``: single-shard ~50k users, layout-compatible with
+        ``sampled-streaming-100b`` in ``utils.get_dataset`` (small disk footprint).
     """
-    processes = []
-    num_files = 100
-    num_users = 5_000_000
-    num_items = 1_000_000_000
+    parser = argparse.ArgumentParser(
+        description="Generate DLRMv3 streaming synthetic CSV data."
+    )
+    parser.add_argument(
+        "--preset",
+        choices=("full", "sampled", "smoke"),
+        default="sampled",
+        help=(
+            "full = 2TB-scale reference; sampled = 50k users / 1 shard (inference layout); "
+            "smoke = 2k users for quick pipeline checks"
+        ),
+    )
+    parser.add_argument(
+        "--output-folder",
+        type=str,
+        default="",
+        help="Output directory (created if missing). Default: ./streaming-100b-<preset>/",
+    )
+    parser.add_argument(
+        "--world-size",
+        type=int,
+        default=0,
+        help="Number of parallel worker processes. 0 = auto (full: 5, sampled: 1).",
+    )
+    args = parser.parse_args()
+
     num_categories = 128
     categories_per_user = 4
     num_timestamps = 100
@@ -644,9 +681,45 @@ def main() -> None:
     num_inference_candidates = 2048
     train_ratio = 0.9
     user_sampling_ratio = 0.7
-    world_size = 5
-    username = os.getlogin()
-    output_folder = f"/home/{username}/data/streaming-100b/"
+
+    if args.preset == "full":
+        num_files = 100
+        num_users = 5_000_000
+        num_items = 1_000_000_000
+        world_size = args.world_size if args.world_size > 0 else 5
+        default_out = os.path.join(
+            os.path.expanduser("~"), "data", "streaming-100b"
+        )
+    elif args.preset == "smoke":
+        num_files = 1
+        num_users = 2_000
+        num_items = 2_000_000
+        world_size = args.world_size if args.world_size > 0 else 1
+        default_out = os.path.join(os.getcwd(), "streaming-100b-smoke")
+    else:
+        # Matches utils.get_dataset(sampled-streaming-100b): 1 file, 50k users,
+        # 100 timestamps.  Use 10M items so ``item_rating`` fits in RAM (~80MiB).
+        num_files = 1
+        num_users = 50_000
+        num_items = 10_000_000
+        world_size = args.world_size if args.world_size > 0 else 1
+        default_out = os.path.join(os.getcwd(), "streaming-100b-sampled")
+
+    out_raw = args.output_folder or default_out
+    output_folder = _out_dir(out_raw)
+    os.makedirs(output_folder, exist_ok=True)
+
+    logger.warning(
+        "preset=%s world_size=%s -> users=%s files=%s items=%s out=%s",
+        args.preset,
+        world_size,
+        num_users,
+        num_files,
+        num_items,
+        output_folder,
+    )
+
+    processes = []
     for i in range(world_size):
         p = multiprocessing.Process(
             target=worker,
